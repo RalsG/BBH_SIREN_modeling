@@ -53,12 +53,13 @@ class Siren(nn.Module):
             
         # Final output layer
         final_linear = nn.Linear(hidden_features, out_features)
-        # Init final layer with smaller bound per SIREN paper for stability
+        # Initialize final layer with smaller bound per SIREN paper (for stability?)
         with torch.no_grad():
             bound = math.sqrt(6 / hidden_features) / w0
             final_linear.weight.uniform_(-bound, bound)
             if final_linear.bias is not None:
-                final_linear.bias.zero()
+                # Intialize final bias to zero
+                nn.init.zeros_(final_linear.bias)
         layers.append(final_linear)
         
 
