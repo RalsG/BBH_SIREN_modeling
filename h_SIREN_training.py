@@ -47,11 +47,8 @@ def get_sxs_simulation_list(num_simulations, eccentricity: str = 'noneccentric')
 
     return df_params, start_time_vec
 
-def load_sxs_data(sxs_id_list: int, start_time_vec: int, time_axis_size: int = 1000, dom_em: int  = 2, dom_ell: int = 2, cache_dir: str = 'sxs_cache', force_reload: bool = False):
+def load_sxs_data(sxs_id_list: int, start_time_vec: int, time_axis_size: int = 1000, dom_em: int  = 2, dom_ell: int = 2):
     """Load and interpolate SXS dominant mode strain for a list of simulation ids.
-
-    This function caches per-simulation interpolated waveforms as compressed .npz files in `cache_dir`.
-    If a cache file exists and force_reload is False it will be loaded instead of re-downloading/interpolating.
 
     Returns:
       waveforms: np.ndarray shape (n_sims, time_axis_size) -- real strain values
@@ -61,24 +58,8 @@ def load_sxs_data(sxs_id_list: int, start_time_vec: int, time_axis_size: int = 1
     waveforms = np.zeros((n, time_axis_size), dtype=np.float32)
     time_axes = np.zeros((n, time_axis_size), dtype=np.float32)
 
-    os.makedirs(cache_dir, exist_ok=True)
-
     for idx, sxs_id_str in enumerate(sxs_id_list):
         print(f"Loading simulation: {sxs_id_str} ({idx+1}/{n})")
-        """
-        # safe filename
-        safe_name = str(sxs_id_str).replace('/', '_').replace(':', '_')
-        cache_path = os.path.join(cache_dir, f"{safe_name}.npz")
-
-        if os.path.exists(cache_path) and not force_reload:
-            try:
-                d = np.load(cache_path)
-                waveforms[idx, :] = d['waveform']
-                time_axes[idx, :] = d['time']
-                continue
-            except Exception:
-                print(f"Warning: failed to load cache {cache_path}, will re-create it.")
-        """
         # load simulation
 
         try:
@@ -92,22 +73,20 @@ def load_sxs_data(sxs_id_list: int, start_time_vec: int, time_axis_size: int = 1
             raise ValueError(f"Strain not found or empty for simulation {sxs_id_str}.")
 
         peak_strain_time = strain_modes_obj.max_norm_time()
-        time_axis = np.linspace(start_time_vec[idx], peak_strain_time, time_axis_size)
-
         # Extract dominant (ell, m) mode and take real part
         dom_mode = strain_modes_obj[:, strain_modes_obj.index(dom_ell, dom_em)]
+        # Make the wave start at a local peak for consistency
+        settled_idx = dom_mode.index_closest_to(start_time_vec[idx])
+        array_for_finding_peak = dom_mode.ndarray.real[settled_idx:]
+        peak_start_idx = scipy.signal.argrelextrema(array_for_finding_peak, np.greater)[0][0]
+        true_start_time = dom_mode.time[settled_idx + peak_start_idx]
+        
+        time_axis = np.linspace(true_start_time, peak_strain_time, time_axis_size)
         interpolated = dom_mode.interpolate(time_axis)
         wf = np.asarray(interpolated.ndarray.real, dtype=np.float32)
         waveforms[idx, :] = wf
         time_axes[idx, :] = time_axis.astype(np.float32)
 
-        """
-        # save to cache
-        try:
-            np.savez_compressed(cache_path, waveform=wf, time=time_axis)
-        except Exception as e:
-            print(f"Warning: failed to write cache {cache_path}: {e}")
-        """
 
     return waveforms, time_axes
 
@@ -124,7 +103,11 @@ def train_siren_arrays(inputs: np.ndarray,
                        device: str = None,
                        checkpoint_path: str = 'siren_checkpoint.pt',
                        val_split: float = 0.1,
-                       plot_path: str = 'training_loss.png') -> Siren:
+                       plot_path: str = 'training_loss.png',
+                       weight_decay: float = 1e-6,
+                       clip_grad_norm: float = 1.0,
+                       lr_patience: int = 10,
+                       min_lr: float = 1e-7) -> Siren:
     """Train a SIREN model from numpy inputs/targets.
 
     inputs: (N, D) array where D == in_features (e.g. [params..., time])
@@ -164,8 +147,10 @@ def train_siren_arrays(inputs: np.ndarray,
         val_loader = None
 
     model = Siren(in_features=in_features, hidden_features=hidden_features, hidden_layers=hidden_layers, out_features=out_features).to(device)
-    opt = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+    opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=lr_patience, min_lr=min_lr)
+    loss_fn = nn.L1Loss()
+    #loss_fn = nn.MSELoss()
     scaler = GradScaler()
 
     train_losses = []
@@ -183,6 +168,13 @@ def train_siren_arrays(inputs: np.ndarray,
                 preds = model(xb)
                 loss = loss_fn(preds, yb)
             scaler.scale(loss).backward()
+            # unscale then clip if requested
+            if clip_grad_norm is not None:
+                try:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
+                except Exception:
+                    pass
             scaler.step(opt)
             scaler.update()
             running += loss.item()
@@ -208,8 +200,10 @@ def train_siren_arrays(inputs: np.ndarray,
             avg_val = val_running / max(1, val_batches)
             val_losses.append(avg_val)
             print(f"Epoch {epoch}/{epochs}  train_loss={avg_train:.6e}  val_loss={avg_val:.6e}")
+            scheduler.step(avg_val)
         else:
             print(f"Epoch {epoch}/{epochs}  train_loss={avg_train:.6e}")
+            scheduler.step(avg_train)
 
         # checkpoint
         torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'optimizer': opt.state_dict()}, checkpoint_path)
@@ -309,12 +303,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-sims', type=int, default=100, help='Number of SXS simulations to select')
     parser.add_argument('--eccentricity', type=str, default='noneccentric', help='Which SXS subset to use')
     parser.add_argument('--time-size', type=int, default=500, help='Number of time samples per waveform')
-    parser.add_argument('--cache-dir', type=str, default='sxs_cache', help='Directory to cache per-simulation .npz files')
-    parser.add_argument('--force-reload', action='store_true', help='If set, ignore cache and re-download/re-interpolate')
     parser.add_argument('--save-processed', type=str, default='processed.npz', help='Where to save processed inputs/targets (.npz)')
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--batch-size', type=int, default=4096)
+    parser.add_argument('--learning-rate', type=float, default=5e-5)
     parser.add_argument('--hidden', type=int, default=256)
     parser.add_argument('--layers', type=int, default=3)
     parser.add_argument('--checkpoint', type=str, default='siren_checkpoint.pt')
@@ -337,17 +329,42 @@ if __name__ == '__main__':
         sxs_id_list = list(map(str, simulations_df.index))
 
         start_time = time.time()
-        waveforms, times = load_sxs_data(sxs_id_list, start_time_vec, time_axis_size=args.time_size, cache_dir=args.cache_dir, force_reload=args.force_reload)
+        waveforms, times = load_sxs_data(sxs_id_list, start_time_vec, time_axis_size=args.time_size)
         end_time = time.time()
         print(f"Loaded SXS data in {end_time - start_time:.2f} seconds.")
 
+        # If the user passed just a filename, place it under
+        # 'processed_data/' folder. Creates directories as needed
+        if args.save_processed:
+            sp = Path(args.save_processed)
+            if sp.parent == Path('.'):
+                sp = Path('processed_data') / sp.name
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            save_processed_path = str(sp)
+        else:
+            save_processed_path = None
+
         inputs, targets, params_np, times = build_inputs_targets_from_loaded(
-            simulations_df, start_time_vec, (waveforms, times), save_npz=args.save_processed)
+            simulations_df, start_time_vec, (waveforms, times), save_npz=save_processed_path)
         in_features = inputs.shape[1]
+
+    # Ensure checkpoint directory exists, adds to 'checkpoint_models/' folder if needed
+    cp = Path(args.checkpoint)
+    if cp.parent == Path('.'):
+        cp = Path('checkpoint_models') / cp.name
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = str(cp)
+
+    # Same for the plot path; 'training_plots/' folder
+    plot_path = Path(args.plot)
+    if plot_path.parent == Path('.'):
+        plot_path = Path('training_plots') / plot_path.name
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plot_path = str(plot_path)
 
     model, history = train_siren_arrays(
         inputs, targets, in_features=in_features, hidden_features=args.hidden, hidden_layers=args.layers,
-        epochs=args.epochs, batch_size=args.bs, lr=args.learning_rate, checkpoint_path=args.checkpoint, val_split=args.val_split, plot_path=args.plot)
+        epochs=args.epochs, batch_size=args.batch_size, lr=args.learning_rate, checkpoint_path=checkpoint_path, val_split=args.val_split, plot_path=plot_path)
 
 
 
