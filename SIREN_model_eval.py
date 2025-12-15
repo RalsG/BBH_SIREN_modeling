@@ -2,9 +2,10 @@
 import numpy as np
 import torch
 from SIREN import Siren
+from SHAN import SHAN
 
 # load processed arrays you saved with build_inputs_targets_from_loaded
-d = np.load("processed_data\processed_1000x1000_peaked_seed43.npz")  # or whatever file you have
+d = np.load("processed_data\processed_1x1000_seed43.npz")  # or whatever file you have
 inputs = d['inputs']          # flattened (n*T, p+1) where last column is time
 targets = d['targets']        # flattened strain (n*T,)
 params = d['params']          # (n, p)
@@ -14,8 +15,9 @@ p = params.shape[1]
 in_features = p + 1
 
 # build model and load checkpoint
-model = Siren(in_features=in_features, hidden_features=512, hidden_layers=4, out_features=1).eval()
-ckpt = torch.load("checkpoint_models\siren_checkpoint_1000waves_20epochs_4x512.pt", map_location='cpu')
+# model = Siren(in_features=in_features, hidden_features=512, hidden_layers=5, out_features=1).eval()
+model = SHAN(in_features=in_features, hidden_features=128, hidden_layers=10).eval()
+ckpt = torch.load("checkpoint_models\SHAN_checkpoint_1waves_1000epochs_10x128.pt", map_location='cpu')
 model.load_state_dict(ckpt['model_state'])
 
 # reconstruct per-sim waveforms
@@ -50,4 +52,4 @@ for i in [0, n//4, n//2, -1]:
     plt.title(f"sim {i} RMSE={rmse_per[i]:.4e} NMSE={nmse_per[i]:.3e}")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(f"1wave_1000epochs_recon_example_{i}.png")
+    plt.savefig(f"SHAN_1wave_1000epochs_recon_example_{i}.png")
